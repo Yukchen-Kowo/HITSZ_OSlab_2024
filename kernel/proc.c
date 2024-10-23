@@ -297,7 +297,8 @@ void reparent(struct proc *p) {
 void exit(int status) {
   struct proc *p = myproc();
 
-  if (p == initproc) panic("init exiting");
+  if (p == initproc)
+    panic("init exiting");
 
   // Close all open files.
   for (int fd = 0; fd < NOFILE; fd++) {
@@ -313,72 +314,119 @@ void exit(int status) {
   end_op();
   p->cwd = 0;
 
-  // we might re-parent a child to init. we can't be precise about
-  // waking up init, since we can't acquire its lock once we've
-  // acquired any other proc lock. so wake up init whether that's
-  // necessary or not. init may miss this wakeup, but that seems
-  // harmless.
+  // Wake up initproc in case we need to reparent any children.
   acquire(&initproc->lock);
   wakeup1(initproc);
   release(&initproc->lock);
 
-  // grab a copy of p->parent, to ensure that we unlock the same
-  // parent we locked. in case our parent gives us away to init while
-  // we're waiting for the parent lock. we may then race with an
-  // exiting parent, but the result will be a harmless spurious wakeup
-  // to a dead or wrong process; proc structs are never re-allocated
-  // as anything else.
+  // Collect parent process info without holding p->lock.
+  struct proc *original_parent;
+  int parent_pid = 0;
+  char parent_name[16] = {0};
+  char *parent_state_str = "???";
+
+  // Acquire p->lock to get the parent.
   acquire(&p->lock);
-  struct proc *original_parent = p->parent;
+  original_parent = p->parent;
   release(&p->lock);
 
-  // we need the parent's lock in order to wake it up from wait().
-  // the parent-then-child rule says we have to lock it first.
-  acquire(&original_parent->lock);
+  // Define the states array with lowercase state names.
+  static char *states[] = {
+      [UNUSED] "unused",
+      [SLEEPING] "sleeping",
+      [RUNNABLE] "runnable",
+      [RUNNING] "running",
+      [ZOMBIE] "zombie"};
 
+  // Acquire original_parent->lock to safely access its info.
+  if (original_parent != 0) {
+    acquire(&original_parent->lock);
+    parent_pid = original_parent->pid;
+    safestrcpy(parent_name, original_parent->name, sizeof(parent_name));
+
+    if (original_parent->state >= 0 && original_parent->state < NELEM(states) && states[original_parent->state]) {
+      parent_state_str = states[original_parent->state];
+    } else {
+      parent_state_str = "???";
+    }
+
+    // Print the parent process information.
+    exit_info("proc %d exit, parent pid %d, name %s, state %s\n",
+              p->pid, parent_pid, parent_name, parent_state_str);
+
+    release(&original_parent->lock);
+  }
+
+  // Collect child processes info without holding p->lock.
+  struct proc *pp;
+  int child_num = 0;
+
+  for (pp = proc; pp < &proc[NPROC]; pp++) {
+    acquire(&pp->lock);
+    if (pp->parent == p) {
+      // Get the child process state.
+      char *child_state;
+      if (pp->state >= 0 && pp->state < NELEM(states) && states[pp->state]) {
+        child_state = states[pp->state];
+      } else {
+        child_state = "???";
+      }
+
+      // Print the child process information.
+      exit_info("proc %d exit, child %d, pid %d, name %s, state %s\n",
+                p->pid, child_num, pp->pid, pp->name, child_state);
+
+      child_num++;
+
+      release(&pp->lock);
+    } else {
+      release(&pp->lock);
+    }
+  }
+
+  // Reacquire p->lock to proceed with exit.
   acquire(&p->lock);
 
-  // Give any children to init.
+  // Reparent any children to init.
   reparent(p);
 
-  // Parent might be sleeping in wait().
+  // Notify the parent in case it is sleeping in wait().
+  acquire(&original_parent->lock);
   wakeup1(original_parent);
+  release(&original_parent->lock);
 
   p->xstate = status;
   p->state = ZOMBIE;
 
-  release(&original_parent->lock);
-
-  // Jump into the scheduler, never to return.
+  // Release p->lock and call sched.
+  // It's important to hold p->lock when calling sched().
   sched();
   panic("zombie exit");
 }
 
+
+
 // Wait for a child process to exit and return its pid.
-// Return -1 if this process has no children.
-int wait(uint64 addr) {
+// If 'flags' is 1, perform a non-blocking wait.
+// Return -1 if this process has no children or if no child has exited (in non-blocking mode).
+int wait(uint64 addr, int flags) {
   struct proc *np;
   int havekids, pid;
   struct proc *p = myproc();
 
-  // hold p->lock for the whole time to avoid lost
-  // wakeups from a child's exit().
   acquire(&p->lock);
 
   for (;;) {
-    // Scan through table looking for exited children.
+    // Scan through process table looking for exited children.
     havekids = 0;
     for (np = proc; np < &proc[NPROC]; np++) {
-      // this code uses np->parent without holding np->lock.
-      // acquiring the lock first would cause a deadlock,
-      // since np might be an ancestor, and we already hold p->lock.
+      // We can safely use np->parent without holding np->lock because
+      // only the parent changes it, and we hold the parent's lock.
       if (np->parent == p) {
-        // np->parent can't change between the check and the acquire()
-        // because only the parent changes it, and we're the parent.
         acquire(&np->lock);
         havekids = 1;
         if (np->state == ZOMBIE) {
-          // Found one.
+          // Found an exited child.
           pid = np->pid;
           if (addr != 0 && copyout(p->pagetable, addr, (char *)&np->xstate, sizeof(np->xstate)) < 0) {
             release(&np->lock);
@@ -394,8 +442,14 @@ int wait(uint64 addr) {
       }
     }
 
-    // No point waiting if we don't have any children.
+    // If no children, or if process was killed, return -1.
     if (!havekids || p->killed) {
+      release(&p->lock);
+      return -1;
+    }
+
+    // If flags indicate non-blocking, return immediately.
+    if (flags == 1) {
       release(&p->lock);
       return -1;
     }
@@ -404,6 +458,9 @@ int wait(uint64 addr) {
     sleep(p, &p->lock);  // DOC: wait-sleep
   }
 }
+
+
+
 
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
